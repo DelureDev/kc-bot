@@ -17,7 +17,7 @@ cat > /opt/kc-test/app.py <<'PYEOF'
 Только стандартная библиотека Python 3.8+.
 
 Переменные окружения: PAGE_PASSWORD, PORT, TW_TOKEN, TW_AGENT_ID, AITUNNEL_KEY,
-AIT_BASE, EMB_MODEL, RERANK_MODEL, DATA_DIR, CLOUDRU_KEY, CLOUDRU_BASE, GIGACHAT_*.
+AIT_BASE, EMB_MODEL, RERANK_MODEL, DATA_DIR, CLOUDRU_KEY, CLOUDRU_BASE, TWGW_KEY, TWGW_BASE, GIGACHAT_*.
 """
 import hmac, http.cookies, json, math, os, re, secrets, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
@@ -43,11 +43,19 @@ GIGA_CA = os.environ.get("GIGACHAT_CA", "/opt/kc-test/russian_trusted_root_ca.pe
 GIGA_MODELS = [m.strip() for m in os.environ.get("GIGACHAT_MODELS", "GigaChat-2,GigaChat-2-Pro,GigaChat-2-Max").split(",") if m.strip()]
 CR_KEY = os.environ.get("CLOUDRU_KEY") or os.environ.get("CLOUD_RU_FOUNDATION_MODELS_API_KEY", "")
 CR_BASE = os.environ.get("CLOUDRU_BASE", "https://foundation-models.api.cloud.ru/v1").rstrip("/")
-CR = {"models": [], "raw": {}, "ts": 0, "err": ""}
+TWGW_KEY = os.environ.get("TWGW_KEY", "")
+TWGW_BASE = os.environ.get("TWGW_BASE", "https://api.timeweb.ai/v1").rstrip("/")
+# OpenAI-совместимые провайдеры: подпись, базовый URL, ключ. Каталог моделей берётся из их /models.
+PROV = {
+    "aitunnel": {"label": "AITunnel", "base": AIT_BASE, "key": AIT_KEY, "env": "AITUNNEL_KEY"},
+    "cloudru": {"label": "Cloud.ru", "base": CR_BASE, "key": CR_KEY, "env": "CLOUDRU_KEY"},
+    "twgw": {"label": "Timeweb AI Gateway", "base": TWGW_BASE, "key": TWGW_KEY, "env": "TWGW_KEY"},
+}
+CAT = {p: {"models": [], "raw": {}, "ts": 0, "err": ""} for p in PROV}
 MODELS = ["gemini-3.5-flash-lite", "gpt-6-luna", "deepseek-v4.1-flash", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
 SESSIONS = {}
 SESS_FILE = os.path.join(DATA_DIR, "sessions.json")
-VERSION = "5"
+VERSION = "6"
 
 
 def save_sessions():
@@ -253,27 +261,29 @@ def rerank(q, cands, top_n=4):
     return picked, time.time() - t0, ok
 
 
-# ---------------------------------------------------------------- Cloud.ru Foundation Models
-def cr_models(force=False):
-    """Каталог моделей Cloud.ru (кэш на час). GigaChat — первыми."""
-    if not CR_KEY or (CR["models"] and not force and time.time() - CR["ts"] < 3600):
-        return CR["models"]
-    req = urllib.request.Request(CR_BASE + "/models", headers={"Authorization": "Bearer " + CR_KEY, "Accept": "application/json"})
+# ---------------------------------------------------------------- каталоги моделей провайдеров
+SKIP = re.compile(r"(embed|rerank|whisper|ocr|bge|e5-|tts|speech|audio|image|video|vision|moderat|guard|transcri|dall|flux|sora|veo|kandinsky|imagen|midjourney|search)", re.I)
+
+
+def catalog(prov, force=False):
+    """Текстовые модели провайдера (кэш на час). GigaChat — первыми."""
+    P, C = PROV[prov], CAT[prov]
+    if not P["key"] or (C["models"] and not force and time.time() - C["ts"] < 3600):
+        return C["models"]
+    req = urllib.request.Request(P["base"] + "/models", headers={"Authorization": "Bearer " + P["key"], "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             j = json.loads(r.read())
-        items = j.get("data") or j.get("models") or []
-        CR["raw"] = {m.get("id"): m for m in items if m.get("id")}
-        ids = list(CR["raw"])
-        skip = re.compile(r"(embed|rerank|whisper|ocr|bge|e5-|vision)", re.I)
-        ids = [i for i in ids if not skip.search(i)] or ids
+        items = j.get("data") or j.get("models") or (j if isinstance(j, list) else [])
+        C["raw"] = {m.get("id"): m for m in items if isinstance(m, dict) and m.get("id")}
+        ids = [i for i in C["raw"] if not SKIP.search(i)] or list(C["raw"])
         ids.sort(key=lambda i: (0 if "gigachat" in i.lower() else 1, i.lower()))
-        CR.update(models=ids, ts=time.time(), err="")
+        C.update(models=ids, ts=time.time(), err="")
     except urllib.error.HTTPError as e:
-        CR["err"] = "Cloud.ru /models %s: %s" % (e.code, e.read()[:200].decode("utf-8", "ignore"))
+        C["err"] = "%s /models %s: %s" % (P["label"], e.code, e.read()[:200].decode("utf-8", "ignore"))
     except Exception as e:
-        CR["err"] = "Cloud.ru /models: %s" % str(e)[:200]
-    return CR["models"]
+        C["err"] = "%s /models: %s" % (P["label"], str(e)[:200])
+    return C["models"]
 
 
 def _num(v):
@@ -283,9 +293,9 @@ def _num(v):
         return None
 
 
-def cr_price(model_id):
-    """Ищет в карточке модели цены за 1М токенов (вход, выход). Формат каталога может меняться — best effort."""
-    m = CR["raw"].get(model_id) or {}
+def price_of(prov, model_id):
+    """(вход, выход) за 1 млн токенов из карточки модели, если провайдер их отдаёт. Best effort."""
+    m = CAT[prov]["raw"].get(model_id) or {}
     found = {}
 
     def walk(o, path):
@@ -294,12 +304,14 @@ def cr_price(model_id):
                 walk(v, path + [str(k).lower()])
         elif _num(o) is not None and any(w in "".join(path) for w in ("price", "pricing", "cost", "tariff")):
             key = path[-1]
+            if "cache" in key:
+                return
             if any(w in key for w in ("input", "prompt", "in_")):
                 found.setdefault("in", _num(o))
-            elif any(w in key for w in ("output", "completion", "out_")):
+            elif any(w in key for w in ("output", "completion", "generated", "out_")):
                 found.setdefault("out", _num(o))
     walk(m, [])
-    return (found.get("in"), found.get("out")) if "in" in found and "out" in found else None
+    return (found["in"], found["out"]) if "in" in found and "out" in found else None
 
 
 def llm(provider, model, msgs, nothink, timeout=90):
@@ -309,26 +321,26 @@ def llm(provider, model, msgs, nothink, timeout=90):
         m = model if model in GIGA_MODELS else GIGA_MODELS[0]
         body["model"] = m
         return giga_chat(body), m
-    if provider == "cloudru":
-        if not CR_KEY:
-            raise RuntimeError("На сервере не задан CLOUDRU_KEY")
-        ids = cr_models()
-        m = model if (model in ids or (not ids and re.fullmatch(r"[\w./:-]{1,120}", str(model or "")))) else (ids[0] if ids else None)
-        if not m:
-            raise RuntimeError(CR["err"] or "Каталог моделей Cloud.ru пуст")
-        body["model"] = m
-        j = post_json(CR_BASE + "/chat/completions", body, {"Authorization": "Bearer " + CR_KEY}, timeout)
-        u = j.get("usage") or {}
-        pr = cr_price(m)
-        if pr and u.get("prompt_tokens") is not None and u.get("cost_rub") is None:
-            u["cost_rub"] = round((u.get("prompt_tokens", 0) * pr[0] + u.get("completion_tokens", 0) * pr[1]) / 1e6, 4)
-            j["usage"] = u
-        return j, m
-    m = model if model in MODELS else MODELS[0]
+    if provider not in PROV:
+        provider = "aitunnel"
+    P = PROV[provider]
+    if not P["key"]:
+        raise RuntimeError("На сервере не задан %s" % P["env"])
+    ids = catalog(provider) or (MODELS if provider == "aitunnel" else [])
+    m = model if model in ids else (ids[0] if ids else None)
+    if not m:
+        raise RuntimeError(CAT[provider]["err"] or "Каталог моделей %s пуст" % P["label"])
     body["model"] = m
-    if nothink and not m.startswith("gemini"):  # у Gemini рассуждение отключить нельзя (API вернёт 400)
-        body["reasoning"] = {"effort": "none"}
-    return ait("/chat/completions", body, timeout), m
+    if nothink and provider == "aitunnel" and not m.startswith("gemini") and "/gemini" not in m:
+        body["reasoning"] = {"effort": "none"}  # у Gemini рассуждение отключить нельзя (API вернёт 400)
+    j = post_json(P["base"] + "/chat/completions", body, {"Authorization": "Bearer " + P["key"]}, timeout)
+    u = j.get("usage") or {}
+    pr = price_of(provider, m)
+    if pr and u.get("prompt_tokens") is not None and u.get("cost_rub") is None:
+        u["cost_rub"] = round((u.get("prompt_tokens", 0) * pr[0] + u.get("completion_tokens", 0) * pr[1]) / 1e6, 4)
+        u["cost_note"] = "по прайсу, без скидки на кэш"
+        j["usage"] = u
+    return j, m
 
 
 def cached_of(u):
@@ -479,15 +491,15 @@ select{padding:4px 8px;border-radius:8px;border:1px solid var(--border);backgrou
 MAIN = """
 <main>
 <h1>Помощник КЦ — тест</h1>
-<p class="sub">Сравнение: агент Timeweb, свой RAG (поиск по кускам) и «вся база в промпте»; модели — AITunnel, Cloud.ru или GigaChat. Под ответом — время по этапам и токены. Не вводите данные пациентов. <a href="admin">Документы и индекс</a> · <a href="logout">Выйти</a></p>
+<p class="sub">Сравнение: агент Timeweb, свой RAG (поиск по кускам) и «вся база в промпте»; модели — AITunnel, Cloud.ru, Timeweb AI Gateway или GigaChat. Под ответом — время по этапам и токены. Не вводите данные пациентов. <a href="admin">Документы и индекс</a> · <a href="logout">Выйти</a></p>
 <div class="chips" id="chips">
 <button class="chip">пациент с отеком щеки и температурой что делать</button><button class="chip">бабушка привела ребенка 10 лет на первый прием</button>
 <button class="chip">какая гарантия на коронку</button><button class="chip">сколько стоит профосмотр</button><button class="chip">сколько стоит имплантация под ключ</button></div>
 <div id="log"></div><div class="card" id="stats" style="display:none"></div></main>
 <div class="bar"><div class="in"><div class="row"><textarea id="q" placeholder="Вопрос… (Enter — отправить)"></textarea><button id="send">Спросить</button></div>
 <div class="opts"><label>Движок <select id="engine"><option value="aitunnel">Свой RAG (поиск по кускам)</option><option value="full">Вся база в промпте</option><option value="timeweb">Timeweb агент</option></select></label>
-<label id="provwrap">Провайдер <select id="provider"><option value="aitunnel">AITunnel</option><option value="cloudru">Cloud.ru</option><option value="gigachat">GigaChat (Сбер)</option></select></label>
-<label>Модель <select id="model">__MODELS__</select><select id="gmodel" style="display:none">__GMODELS__</select><select id="cmodel" style="display:none">__CMODELS__</select></label>
+<label id="provwrap">Провайдер <select id="provider"><option value="aitunnel">AITunnel</option><option value="cloudru">Cloud.ru</option><option value="twgw">Timeweb AI Gateway</option><option value="gigachat">GigaChat (Сбер)</option></select></label>
+<label>Модель <select id="model">__MODELS__</select><select id="gmodel" style="display:none">__GMODELS__</select><select id="cmodel" style="display:none">__CMODELS__</select><select id="tmodel" style="display:none">__TMODELS__</select></label>
 <label><input type="checkbox" id="nothink" checked> без рассуждения</label><label><input type="checkbox" id="rerank"> реранк (+0,45 ₽)</label><span id="status"></span></div></div></div>
 <script>
 (function(){
@@ -497,8 +509,8 @@ function md(s){var L=esc(s).split('\\n'),h='',ul=false;L.forEach(function(l){var
 function med(a){var b=a.slice().sort(function(x,y){return x-y}),m=Math.floor(b.length/2);return b.length%2?b[m]:(b[m-1]+b[m])/2}
 function upd(){var p=[];for(var k in T){p.push(k+': '+T[k].length+' вопр., медиана '+med(T[k]).toFixed(1)+' с')}stats.style.display=p.length?'':'none';stats.textContent='Итого — '+p.join(' · ')}
 window.kcAsk=function(text,opts){opts=opts||{};text=String(text).trim();if(!text)return Promise.resolve();
-var engine=opts.engine||document.getElementById('engine').value,provider=opts.provider||document.getElementById('provider').value,model=opts.model||document.getElementById(engine==='timeweb'?'model':({gigachat:'gmodel',cloudru:'cmodel'}[provider]||'model')).value,nothink=opts.nothink!=null?opts.nothink:document.getElementById('nothink').checked,rr=opts.rerank!=null?opts.rerank:document.getElementById('rerank').checked;
-var pn={aitunnel:'AITunnel',cloudru:'Cloud.ru',gigachat:'GigaChat'}[provider]||provider;
+var engine=opts.engine||document.getElementById('engine').value,provider=opts.provider||document.getElementById('provider').value,model=opts.model||document.getElementById(engine==='timeweb'?'model':({gigachat:'gmodel',cloudru:'cmodel',twgw:'tmodel'}[provider]||'model')).value,nothink=opts.nothink!=null?opts.nothink:document.getElementById('nothink').checked,rr=opts.rerank!=null?opts.rerank:document.getElementById('rerank').checked;
+var pn={aitunnel:'AITunnel',cloudru:'Cloud.ru',twgw:'Timeweb GW',gigachat:'GigaChat'}[provider]||provider;
 var label=engine==='timeweb'?'Timeweb агент':(engine==='full'?'Вся база · '+pn+' · '+model:'RAG · '+pn+' · '+model+(nothink?'':' · с рассуждением')+(rr?' · реранк':''));
 var qd=document.createElement('div');qd.className='card q';qd.textContent=text;log.appendChild(qd);var ad=document.createElement('div');ad.className='card';ad.innerHTML='<span class="meta">Жду ответ…</span>';log.appendChild(ad);ad.scrollIntoView({block:'end'});
 send.disabled=true;q.value='';var t0=performance.now(),tm=setInterval(function(){st.textContent=((performance.now()-t0)/1000).toFixed(1)+' с…'},100);
@@ -507,11 +519,11 @@ var sec=(performance.now()-t0)/1000;if(j.error){ad.innerHTML='<div class="err">'
 (T[label]=T[label]||[]).push(sec);upd();var u=j.usage||{},t=j.timing||{};
 var parts=[];if(t.embed!=null)parts.push('эмбеддинг '+t.embed+' с');if(t.search!=null)parts.push('поиск '+t.search+' с');if(t.rerank)parts.push('реранк '+t.rerank+' с'+(j.rerank_ok?'':' (не сработал)'));parts.push('модель '+t.llm+' с');
 ad.innerHTML='<div class="ans">'+md(j.answer||'(пусто)')+'</div>'+(j.sources&&j.sources.length?'<div class="src">Фрагменты: '+esc(j.sources.join('; '))+'</div>':'')+
-'<div class="meta"><span class="'+(sec<=5?'fast':'slow')+'">⏱ '+sec.toFixed(1)+' с всего</span><span>'+parts.join(' · ')+'</span>'+(u.prompt_tokens?'<span>токены: '+u.prompt_tokens+(j.cached?' (кэш '+j.cached+')':'')+' / '+u.completion_tokens+'</span>':'')+(u.cost_rub!=null?'<span>'+u.cost_rub+' ₽</span>':'')+'<span>'+esc(label)+'</span></div>';
+'<div class="meta"><span class="'+(sec<=5?'fast':'slow')+'">⏱ '+sec.toFixed(1)+' с всего</span><span>'+parts.join(' · ')+'</span>'+(u.prompt_tokens?'<span>токены: '+u.prompt_tokens+(j.cached?' (кэш '+j.cached+')':'')+' / '+u.completion_tokens+'</span>':'')+(u.cost_rub!=null?'<span>'+(u.cost_note?'≈ ':'')+u.cost_rub+' ₽</span>':'')+'<span>'+esc(label)+'</span></div>';
 return {sec:sec,j:j,label:label}}).catch(function(e){ad.innerHTML='<div class="err">'+esc(e)+'</div>'}).then(function(x){clearInterval(tm);st.textContent='';send.disabled=false;return x})};
 send.onclick=function(){kcAsk(q.value)};q.onkeydown=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(!send.disabled)kcAsk(q.value)}};
 document.getElementById('chips').onclick=function(e){var b=e.target.closest('.chip');if(b&&!send.disabled)kcAsk(b.textContent)};
-function sync(){var e=document.getElementById('engine').value,p=e==='timeweb'?'aitunnel':document.getElementById('provider').value;document.getElementById('provwrap').style.display=e==='timeweb'?'none':'';document.getElementById('model').style.display=p==='aitunnel'?'':'none';document.getElementById('gmodel').style.display=p==='gigachat'?'':'none';document.getElementById('cmodel').style.display=p==='cloudru'?'':'none';document.getElementById('model').disabled=e==='timeweb';document.getElementById('rerank').parentNode.style.display=e==='aitunnel'?'':'none'}
+function sync(){var e=document.getElementById('engine').value,p=e==='timeweb'?'aitunnel':document.getElementById('provider').value;document.getElementById('provwrap').style.display=e==='timeweb'?'none':'';document.getElementById('model').style.display=p==='aitunnel'?'':'none';document.getElementById('gmodel').style.display=p==='gigachat'?'':'none';document.getElementById('cmodel').style.display=p==='cloudru'?'':'none';document.getElementById('tmodel').style.display=p==='twgw'?'':'none';document.getElementById('model').disabled=e==='timeweb';document.getElementById('rerank').parentNode.style.display=e==='aitunnel'?'':'none'}
 document.getElementById('engine').onchange=sync;document.getElementById('provider').onchange=sync;sync();
 })();
 </script>
@@ -587,16 +599,23 @@ class H(BaseHTTPRequestHandler):
                                  "emb_tokens": INDEX.get("emb_tokens"), "docs": docs})
         if p.endswith("/admin"):
             return self.send(200, page(ADMIN))
-        if p.endswith("/cloudru/models"):
-            ids = cr_models(force=True)
-            return self.js(200, {"models": ids, "err": CR["err"], "prices": {i: cr_price(i) for i in ids},
-                                 "sample": [CR["raw"][i] for i in ids[:3]]})
+        mm = re.search(r"/(aitunnel|cloudru|twgw)/models$", p)
+        if mm:
+            pv = mm.group(1)
+            ids = catalog(pv, force=True)
+            return self.js(200, {"models": ids, "err": CAT[pv]["err"], "prices": {i: price_of(pv, i) for i in ids},
+                                 "raw": {i: CAT[pv]["raw"].get(i) for i in ids} if "raw=1" in self.path else None})
         opts = "".join("<option>%s</option>" % m for m in MODELS)
         gopts = "".join("<option>%s</option>" % m for m in GIGA_MODELS)
-        cids = cr_models()
-        copts = "".join("<option>%s</option>" % re.sub(r"[<>&\"]", "", m) for m in cids) or \
-            "<option value=''>%s</option>" % ("нет CLOUDRU_KEY" if not CR_KEY else "каталог недоступен")
-        return self.send(200, page(MAIN.replace("__MODELS__", opts).replace("__GMODELS__", gopts).replace("__CMODELS__", copts)))
+        def opts_for(pv, first=()):
+            ids = catalog(pv)
+            ids = [m for m in first if m in ids] + [m for m in ids if m not in first]
+            return "".join("<option>%s</option>" % re.sub(r"[<>&\"]", "", m) for m in ids) or \
+                "<option value=''>%s</option>" % ("нет " + PROV[pv]["env"] if not PROV[pv]["key"] else "каталог недоступен")
+        if catalog("aitunnel"):
+            opts = opts_for("aitunnel", MODELS)
+        return self.send(200, page(MAIN.replace("__MODELS__", opts).replace("__GMODELS__", gopts)
+                                   .replace("__CMODELS__", opts_for("cloudru")).replace("__TMODELS__", opts_for("twgw"))))
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -641,7 +660,7 @@ class H(BaseHTTPRequestHandler):
                     return self.js(200, answer_tw(q, bool(data.get("nothink"))))
                 if data.get("engine") == "full":
                     return self.js(200, answer_full(q, data.get("provider") or "aitunnel", data.get("model"), bool(data.get("nothink"))))
-                prov = data.get("provider") if data.get("provider") in ("aitunnel", "cloudru", "gigachat") else "aitunnel"
+                prov = data.get("provider") if data.get("provider") in ("aitunnel", "cloudru", "twgw", "gigachat") else "aitunnel"
                 return self.js(200, answer_ait(q, data.get("model"), bool(data.get("nothink")), data.get("rerank") is True, min(int(data.get("top_k") or 6), 12), "rrf" if data.get("fusion") == "rrf" else "interleave", prov))
         except Exception as e:
             return self.js(502, {"error": str(e)[:400]})
@@ -681,6 +700,10 @@ fi
 if [ -z "$(getv CLOUDRU_KEY)" ]; then
   read -r -s -p "API-ключ Cloud.ru Foundation Models (Enter — пропустить): " CK </dev/tty; echo
   if [ -n "$CK" ]; then echo "CLOUDRU_KEY=$CK" >> "$ENVF"; fi
+fi
+if [ -z "$(getv TWGW_KEY)" ]; then
+  read -r -s -p "API-ключ Timeweb AI Gateway (панель Timeweb → AI Gateway → API-ключи; Enter — пропустить): " TK </dev/tty; echo
+  if [ -n "$TK" ]; then echo "TWGW_KEY=$TK" >> "$ENVF"; fi
 fi
 if [ -z "$(getv GIGACHAT_AUTH_KEY)" ]; then
   read -r -s -p "Ключ авторизации GigaChat (Authorization key из кабинета Сбера; Enter — пропустить): " GK </dev/tty; echo
@@ -728,6 +751,7 @@ if systemctl is-active --quiet kc-test; then
   echo "Готово: http://$(hostname -I | awk '{print $1}'):${PORT}/"
   grep -q '^AITUNNEL_KEY=' "$ENVF" && echo "Ключ AITunnel: задан" || echo "Ключ AITunnel: НЕ задан"
   grep -q '^CLOUDRU_KEY=' "$ENVF" && echo "Ключ Cloud.ru: задан" || echo "Ключ Cloud.ru: не задан"
+  grep -q '^TWGW_KEY=' "$ENVF" && echo "Ключ Timeweb AI Gateway: задан" || echo "Ключ Timeweb AI Gateway: не задан"
   grep -q '^GIGACHAT_AUTH_KEY=' "$ENVF" && echo "Ключ GigaChat: задан" || echo "Ключ GigaChat: не задан (можно добавить позже, запустив установку ещё раз)"
 else
   echo "Сервис не запустился:"; journalctl -u kc-test -n 20 --no-pager
