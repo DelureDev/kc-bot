@@ -40,7 +40,7 @@ os.makedirs(DOCS_DIR, exist_ok=True)
 MODELS = ["gemini-3.5-flash-lite", "deepseek-v4.1-flash", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
 SESSIONS = {}
 SESS_FILE = os.path.join(DATA_DIR, "sessions.json")
-VERSION = "3"
+VERSION = "3.1"
 
 
 def save_sessions():
@@ -194,7 +194,7 @@ def bm25(qt, c, k1=1.4, b=0.75):
     return s
 
 
-def search(q, k=12):
+def search(q, k=12, fusion="interleave"):
     """Гибридный поиск: смысл (эмбеддинги) + совпадение слов (BM25), объединение рангов (RRF)."""
     t0 = time.time()
     if q in QCACHE:
@@ -213,7 +213,19 @@ def search(q, k=12):
         bm = [bm25(qt, c) for c in chunks]
     r_cos = {i: r for r, i in enumerate(sorted(range(len(chunks)), key=lambda i: -cos[i]))}
     r_bm = {i: r for r, i in enumerate(sorted(range(len(chunks)), key=lambda i: -bm[i]))}
-    fused = sorted(range(len(chunks)), key=lambda i: -(1.0 / (60 + r_cos[i]) + (1.0 / (60 + r_bm[i]) if bm[i] > 0 else 0)))
+    if fusion == "rrf":
+        fused = sorted(range(len(chunks)), key=lambda i: -(1.0 / (60 + r_cos[i]) + (1.0 / (60 + r_bm[i]) if bm[i] > 0 else 0)))
+    else:  # interleave: по очереди лучший по словам и лучший по смыслу — точные формулировки не теряются
+        by_bm = [i for i in sorted(range(len(chunks)), key=lambda i: -bm[i]) if bm[i] > 0]
+        by_cos = sorted(range(len(chunks)), key=lambda i: -cos[i])
+        fused, seen = [], set()
+        for pair in zip(by_bm + [None] * len(by_cos), by_cos):
+            for i in pair:
+                if i is not None and i not in seen:
+                    seen.add(i)
+                    fused.append(i)
+            if len(fused) >= k:
+                break
     scored = [(cos[i], chunks[i]) for i in fused[:k]]
     t_search = time.time() - t1
     return scored, t_emb, t_search, qtok
@@ -234,11 +246,11 @@ def rerank(q, cands, top_n=4):
     return picked, time.time() - t0, ok
 
 
-def answer_ait(q, model, nothink, use_rerank=False, top_k=6):
+def answer_ait(q, model, nothink, use_rerank=False, top_k=6, fusion="interleave"):
     if not INDEX.get("chunks"):
         raise RuntimeError("Индекс пуст: загрузите документы в /admin и нажмите «Переиндексировать»")
     T0 = time.time()
-    cands, t_emb, t_search, qtok = search(q)
+    cands, t_emb, t_search, qtok = search(q, fusion=fusion)
     if use_rerank:
         top, t_rr, rr_ok = rerank(q, cands, top_n=top_k)
     else:
@@ -449,7 +461,7 @@ class H(BaseHTTPRequestHandler):
                 if data.get("engine") == "timeweb":
                     return self.js(200, answer_tw(q, bool(data.get("nothink"))))
                 model = data.get("model") if data.get("model") in MODELS else MODELS[0]
-                return self.js(200, answer_ait(q, model, bool(data.get("nothink")), data.get("rerank") is True, int(data.get("top_k") or 6)))
+                return self.js(200, answer_ait(q, model, bool(data.get("nothink")), data.get("rerank") is True, min(int(data.get("top_k") or 6), 12), "rrf" if data.get("fusion") == "rrf" else "interleave"))
         except Exception as e:
             return self.js(502, {"error": str(e)[:400]})
         self.send(404, b"not found")
