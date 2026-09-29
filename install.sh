@@ -19,7 +19,7 @@ cat > /opt/kc-test/app.py <<'PYEOF'
 Переменные окружения: PAGE_PASSWORD, PORT, TW_TOKEN, TW_AGENT_ID, AITUNNEL_KEY,
 AIT_BASE, EMB_MODEL, RERANK_MODEL, DATA_DIR.
 """
-import hmac, http.cookies, json, math, os, re, secrets, threading, time
+import hmac, http.cookies, json, math, os, re, secrets, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -37,10 +37,14 @@ DOCS_DIR = os.path.join(DATA_DIR, "docs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 os.makedirs(DOCS_DIR, exist_ok=True)
 
-MODELS = ["gemini-3.5-flash-lite", "deepseek-v4.1-flash", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
+GIGA_KEY = os.environ.get("GIGACHAT_AUTH_KEY", "")
+GIGA_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_CORP")
+GIGA_CA = os.environ.get("GIGACHAT_CA", "/opt/kc-test/russian_trusted_root_ca.pem")
+GIGA_MODELS = [m.strip() for m in os.environ.get("GIGACHAT_MODELS", "GigaChat-2,GigaChat-2-Pro,GigaChat-2-Max").split(",") if m.strip()]
+MODELS = ["gemini-3.5-flash-lite", "gpt-6-luna", "deepseek-v4.1-flash", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
 SESSIONS = {}
 SESS_FILE = os.path.join(DATA_DIR, "sessions.json")
-VERSION = "3.1"
+VERSION = "4"
 
 
 def save_sessions():
@@ -276,6 +280,93 @@ def answer_ait(q, model, nothink, use_rerank=False, top_k=6, fusion="interleave"
     }
 
 
+# ---------------------------------------------------------------- full context (вся база в промпте)
+FULL = {"text": "", "chars": 0}
+
+SYSTEM_FULL = SYSTEM.replace("по фрагментам базы знаний ниже", "по базе знаний ниже").replace("Цифры, сроки, телефоны и фамилии бери точно из фрагментов", "Цифры, сроки, телефоны и фамилии бери точно из базы").replace("Если во фрагментах нет ответа", "Если в базе нет ответа").replace("Если фрагменты противоречат", "Если документы противоречат")
+
+
+def build_full():
+    parts = []
+    for fn in sorted(os.listdir(DOCS_DIR)):
+        if fn.endswith((".md", ".txt")):
+            with open(os.path.join(DOCS_DIR, fn), encoding="utf-8") as f:
+                t = f.read()
+            t = re.sub(r"https?://\S+", "", t)            # ссылки модели не нужны
+            t = re.sub(r"\|\s*:-:\s*", "|", t)
+            t = re.sub(r"[ \t]+", " ", t)
+            t = re.sub(r"\n{2,}", "\n", t)
+            parts.append("=== ДОКУМЕНТ: %s ===\n%s" % (fn, t.strip()))
+    FULL["text"] = "\n\n".join(parts)
+    FULL["chars"] = len(FULL["text"])
+
+
+GIGA = {"token": None, "exp": 0}
+
+
+def giga_ctx():
+    import ssl
+    ctx = ssl.create_default_context()
+    if os.path.exists(GIGA_CA):
+        ctx.load_verify_locations(GIGA_CA)
+    return ctx
+
+
+def giga_token():
+    if GIGA["token"] and time.time() < GIGA["exp"] - 60:
+        return GIGA["token"]
+    if not GIGA_KEY:
+        raise RuntimeError("На сервере не задан GIGACHAT_AUTH_KEY")
+    req = urllib.request.Request("https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+                                 data=urllib.parse.urlencode({"scope": GIGA_SCOPE}).encode(), method="POST",
+                                 headers={"Authorization": "Basic " + GIGA_KEY, "RqUID": str(uuid.uuid4()),
+                                          "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=giga_ctx()) as r:
+            j = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("GigaChat OAuth %s: %s" % (e.code, e.read()[:200].decode("utf-8", "ignore")))
+    GIGA["token"] = j["access_token"]
+    GIGA["exp"] = j.get("expires_at", 0) / 1000 or time.time() + 1500
+    return GIGA["token"]
+
+
+def giga_chat(body):
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request("https://gigachat.devices.sberbank.ru/api/v1/chat/completions", data=data, method="POST",
+                                 headers={"Authorization": "Bearer " + giga_token(), "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120, context=giga_ctx()) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("GigaChat %s: %s" % (e.code, e.read()[:300].decode("utf-8", "ignore")))
+
+
+def answer_full(q, provider, model, nothink):
+    if not FULL["text"]:
+        build_full()
+    if not FULL["text"]:
+        raise RuntimeError("Нет документов: загрузите их в /admin")
+    msgs = [{"role": "system", "content": SYSTEM_FULL + "\n\nБАЗА ЗНАНИЙ:\n" + FULL["text"]},
+            {"role": "user", "content": "Вопрос администратора: " + q}]
+    t0 = time.time()
+    if provider == "gigachat":
+        m = model if model in GIGA_MODELS else GIGA_MODELS[0]
+        j = giga_chat({"model": m, "messages": msgs, "temperature": 0.2, "max_tokens": 700})
+    else:
+        m = model if model in MODELS else MODELS[0]
+        body = {"model": m, "messages": msgs, "temperature": 0.2, "max_tokens": 700}
+        if nothink and not m.startswith("gemini"):
+            body["reasoning"] = {"effort": "none"}
+        j = ait("/chat/completions", body, timeout=120)
+    t = time.time() - t0
+    msg = (j.get("choices") or [{}])[0].get("message") or {}
+    u = j.get("usage") or {}
+    cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or u.get("precached_prompt_tokens") or 0
+    return {"answer": msg.get("content") or "", "usage": u, "cached": cached, "model": j.get("model") or m,
+            "timing": {"llm": round(t, 2), "total": round(t, 2)}, "sources": ["вся база: %d тыс. символов" % (FULL["chars"] // 1000)]}
+
+
 def answer_tw(q, nothink):
     if not TW_TOKEN:
         raise RuntimeError("На сервере не задан TW_TOKEN")
@@ -312,14 +403,15 @@ select{padding:4px 8px;border-radius:8px;border:1px solid var(--border);backgrou
 MAIN = """
 <main>
 <h1>Помощник КЦ — тест</h1>
-<p class="sub">Сравнение: агент Timeweb (их база знаний) и свой RAG на AITunnel. Под ответом — время по этапам и токены. Не вводите данные пациентов. <a href="admin">Документы и индекс</a> · <a href="logout">Выйти</a></p>
+<p class="sub">Сравнение: агент Timeweb, свой RAG на AITunnel и «вся база в промпте» (AITunnel или GigaChat). Под ответом — время по этапам и токены. Не вводите данные пациентов. <a href="admin">Документы и индекс</a> · <a href="logout">Выйти</a></p>
 <div class="chips" id="chips">
 <button class="chip">пациент с отеком щеки и температурой что делать</button><button class="chip">бабушка привела ребенка 10 лет на первый прием</button>
 <button class="chip">какая гарантия на коронку</button><button class="chip">сколько стоит профосмотр</button><button class="chip">сколько стоит имплантация под ключ</button></div>
 <div id="log"></div><div class="card" id="stats" style="display:none"></div></main>
 <div class="bar"><div class="in"><div class="row"><textarea id="q" placeholder="Вопрос… (Enter — отправить)"></textarea><button id="send">Спросить</button></div>
-<div class="opts"><label>Движок <select id="engine"><option value="aitunnel">AITunnel + свой RAG</option><option value="timeweb">Timeweb агент</option></select></label>
-<label>Модель <select id="model">__MODELS__</select></label>
+<div class="opts"><label>Движок <select id="engine"><option value="aitunnel">AITunnel + свой RAG</option><option value="full">Вся база в промпте</option><option value="timeweb">Timeweb агент</option></select></label>
+<label id="provwrap" style="display:none">Провайдер <select id="provider"><option value="aitunnel">AITunnel</option><option value="gigachat">GigaChat (Сбер)</option></select></label>
+<label>Модель <select id="model">__MODELS__</select><select id="gmodel" style="display:none">__GMODELS__</select></label>
 <label><input type="checkbox" id="nothink" checked> без рассуждения</label><label><input type="checkbox" id="rerank"> реранк (+0,45 ₽)</label><span id="status"></span></div></div></div>
 <script>
 (function(){
@@ -329,20 +421,21 @@ function md(s){var L=esc(s).split('\\n'),h='',ul=false;L.forEach(function(l){var
 function med(a){var b=a.slice().sort(function(x,y){return x-y}),m=Math.floor(b.length/2);return b.length%2?b[m]:(b[m-1]+b[m])/2}
 function upd(){var p=[];for(var k in T){p.push(k+': '+T[k].length+' вопр., медиана '+med(T[k]).toFixed(1)+' с')}stats.style.display=p.length?'':'none';stats.textContent='Итого — '+p.join(' · ')}
 window.kcAsk=function(text,opts){opts=opts||{};text=String(text).trim();if(!text)return Promise.resolve();
-var engine=opts.engine||document.getElementById('engine').value,model=opts.model||document.getElementById('model').value,nothink=opts.nothink!=null?opts.nothink:document.getElementById('nothink').checked,rr=opts.rerank!=null?opts.rerank:document.getElementById('rerank').checked;
-var label=engine==='timeweb'?'Timeweb агент':'AITunnel · '+model+(nothink?'':' · с рассуждением')+(rr?' · реранк':'');
+var engine=opts.engine||document.getElementById('engine').value,provider=opts.provider||document.getElementById('provider').value,model=opts.model||(engine==='full'&&provider==='gigachat'?document.getElementById('gmodel').value:document.getElementById('model').value),nothink=opts.nothink!=null?opts.nothink:document.getElementById('nothink').checked,rr=opts.rerank!=null?opts.rerank:document.getElementById('rerank').checked;
+var label=engine==='timeweb'?'Timeweb агент':(engine==='full'?'Вся база · '+(provider==='gigachat'?'GigaChat':'AITunnel')+' · '+model:'RAG · AITunnel · '+model+(nothink?'':' · с рассуждением')+(rr?' · реранк':''));
 var qd=document.createElement('div');qd.className='card q';qd.textContent=text;log.appendChild(qd);var ad=document.createElement('div');ad.className='card';ad.innerHTML='<span class="meta">Жду ответ…</span>';log.appendChild(ad);ad.scrollIntoView({block:'end'});
 send.disabled=true;q.value='';var t0=performance.now(),tm=setInterval(function(){st.textContent=((performance.now()-t0)/1000).toFixed(1)+' с…'},100);
-return fetch('api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:text,engine:engine,model:model,nothink:nothink,rerank:rr})}).then(function(r){return r.json()}).then(function(j){
+return fetch('api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:text,engine:engine,provider:provider,model:model,nothink:nothink,rerank:rr})}).then(function(r){return r.json()}).then(function(j){
 var sec=(performance.now()-t0)/1000;if(j.error){ad.innerHTML='<div class="err">'+esc(j.error)+'</div>';return {error:j.error}}
 (T[label]=T[label]||[]).push(sec);upd();var u=j.usage||{},t=j.timing||{};
 var parts=[];if(t.embed!=null)parts.push('эмбеддинг '+t.embed+' с');if(t.search!=null)parts.push('поиск '+t.search+' с');if(t.rerank)parts.push('реранк '+t.rerank+' с'+(j.rerank_ok?'':' (не сработал)'));parts.push('модель '+t.llm+' с');
 ad.innerHTML='<div class="ans">'+md(j.answer||'(пусто)')+'</div>'+(j.sources&&j.sources.length?'<div class="src">Фрагменты: '+esc(j.sources.join('; '))+'</div>':'')+
-'<div class="meta"><span class="'+(sec<=5?'fast':'slow')+'">⏱ '+sec.toFixed(1)+' с всего</span><span>'+parts.join(' · ')+'</span>'+(u.prompt_tokens?'<span>токены: '+u.prompt_tokens+' / '+u.completion_tokens+'</span>':'')+'<span>'+esc(label)+'</span></div>';
+'<div class="meta"><span class="'+(sec<=5?'fast':'slow')+'">⏱ '+sec.toFixed(1)+' с всего</span><span>'+parts.join(' · ')+'</span>'+(u.prompt_tokens?'<span>токены: '+u.prompt_tokens+(j.cached?' (кэш '+j.cached+')':'')+' / '+u.completion_tokens+'</span>':'')+(u.cost_rub!=null?'<span>'+u.cost_rub+' ₽</span>':'')+'<span>'+esc(label)+'</span></div>';
 return {sec:sec,j:j,label:label}}).catch(function(e){ad.innerHTML='<div class="err">'+esc(e)+'</div>'}).then(function(x){clearInterval(tm);st.textContent='';send.disabled=false;return x})};
 send.onclick=function(){kcAsk(q.value)};q.onkeydown=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(!send.disabled)kcAsk(q.value)}};
 document.getElementById('chips').onclick=function(e){var b=e.target.closest('.chip');if(b&&!send.disabled)kcAsk(b.textContent)};
-document.getElementById('engine').onchange=function(){document.getElementById('model').disabled=this.value==='timeweb'};
+function sync(){var e=document.getElementById('engine').value,p=document.getElementById('provider').value,g=e==='full'&&p==='gigachat';document.getElementById('provwrap').style.display=e==='full'?'':'none';document.getElementById('model').style.display=g?'none':'';document.getElementById('gmodel').style.display=g?'':'none';document.getElementById('model').disabled=e==='timeweb';document.getElementById('rerank').parentNode.style.display=e==='aitunnel'?'':'none'}
+document.getElementById('engine').onchange=sync;document.getElementById('provider').onchange=sync;sync();
 })();
 </script>
 """
@@ -418,7 +511,8 @@ class H(BaseHTTPRequestHandler):
         if p.endswith("/admin"):
             return self.send(200, page(ADMIN))
         opts = "".join("<option>%s</option>" % m for m in MODELS)
-        return self.send(200, page(MAIN.replace("__MODELS__", opts)))
+        gopts = "".join("<option>%s</option>" % m for m in GIGA_MODELS)
+        return self.send(200, page(MAIN.replace("__MODELS__", opts).replace("__GMODELS__", gopts)))
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -447,6 +541,7 @@ class H(BaseHTTPRequestHandler):
                     return self.js(400, {"error": "Имя файла: только .md или .txt"})
                 with open(os.path.join(DOCS_DIR, name), "w", encoding="utf-8") as f:
                     f.write(str(data.get("content", "")))
+                FULL["text"] = ""
                 return self.js(200, {"ok": True})
             if p.endswith("/admin/reindex"):
                 idx = build_index()
@@ -460,6 +555,8 @@ class H(BaseHTTPRequestHandler):
                     return self.js(400, {"error": "Пустой или слишком длинный вопрос"})
                 if data.get("engine") == "timeweb":
                     return self.js(200, answer_tw(q, bool(data.get("nothink"))))
+                if data.get("engine") == "full":
+                    return self.js(200, answer_full(q, data.get("provider") or "aitunnel", data.get("model"), bool(data.get("nothink"))))
                 model = data.get("model") if data.get("model") in MODELS else MODELS[0]
                 return self.js(200, answer_ait(q, model, bool(data.get("nothink")), data.get("rerank") is True, min(int(data.get("top_k") or 6), 12), "rrf" if data.get("fusion") == "rrf" else "interleave"))
         except Exception as e:
@@ -492,6 +589,23 @@ if [ -z "$(getv AITUNNEL_KEY)" ]; then
   read -r -s -p "API-ключ AITunnel (Enter — пропустить): " AK </dev/tty; echo
   if [ -n "$AK" ]; then echo "AITUNNEL_KEY=$AK" >> "$ENVF"; fi
 fi
+if [ -z "$(getv GIGACHAT_AUTH_KEY)" ]; then
+  read -r -s -p "Ключ авторизации GigaChat (Authorization key из кабинета Сбера; Enter — пропустить): " GK </dev/tty; echo
+  if [ -n "$GK" ]; then
+    echo "GIGACHAT_AUTH_KEY=$GK" >> "$ENVF"
+    read -r -p "Scope GigaChat (Enter = GIGACHAT_API_CORP; для физлица — GIGACHAT_API_PERS): " GS </dev/tty
+    echo "GIGACHAT_SCOPE=${GS:-GIGACHAT_API_CORP}" >> "$ENVF"
+  fi
+fi
+# Корневой сертификат НУЦ Минцифры — нужен для API GigaChat
+if ! grep -q "BEGIN CERTIFICATE" /opt/kc-test/russian_trusted_root_ca.pem 2>/dev/null; then
+  TMPCA=$(mktemp)
+  curl -fsSL https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt >> "$TMPCA" 2>/dev/null || true
+  echo >> "$TMPCA"
+  curl -fsSL https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt >> "$TMPCA" 2>/dev/null || true
+  if grep -q "BEGIN CERTIFICATE" "$TMPCA"; then install -m 644 "$TMPCA" /opt/kc-test/russian_trusted_root_ca.pem; else echo "Внимание: не удалось скачать сертификат Минцифры (нужен только для GigaChat)"; fi
+  rm -f "$TMPCA"
+fi
 [ -n "$(getv TW_AGENT_ID)" ] || echo "TW_AGENT_ID=d94b4d73-2ce5-4006-a6f5-4039b60c2d9e" >> "$ENVF"
 [ -n "$(getv PORT)" ] || echo "PORT=8790" >> "$ENVF"
 PORT=$(getv PORT)
@@ -520,6 +634,7 @@ sleep 1.5
 if systemctl is-active --quiet kc-test; then
   echo "Готово: http://$(hostname -I | awk '{print $1}'):${PORT}/"
   grep -q '^AITUNNEL_KEY=' "$ENVF" && echo "Ключ AITunnel: задан" || echo "Ключ AITunnel: НЕ задан"
+  grep -q '^GIGACHAT_AUTH_KEY=' "$ENVF" && echo "Ключ GigaChat: задан" || echo "Ключ GigaChat: не задан (можно добавить позже, запустив установку ещё раз)"
 else
   echo "Сервис не запустился:"; journalctl -u kc-test -n 20 --no-pager
 fi
