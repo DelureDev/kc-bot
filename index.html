@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Помощник КЦ — тест</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2230; --muted:#5d6678; --accent:#6b6ef8; --border:#e3e6ec; --warn-bg:#fff6e5; --warn:#8a5a00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141821; --card:#1c2230; --text:#e8ebf2; --muted:#a2aabb; --accent:#8f92ff; --border:#2c3444; --warn-bg:#3a2e14; --warn:#f3c56b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.55 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:32px 16px 120px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 24px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:16px; }
+  .card h2 { font-size:17px; margin:0 0 10px; }
+  ul { margin:0; padding-left:20px; }
+  li { margin:4px 0; }
+  .warn { background:var(--warn-bg); color:var(--warn); border-color:transparent; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { border:1px solid var(--border); border-radius:999px; padding:6px 12px; font-size:14px; background:transparent; color:var(--text); cursor:pointer; }
+  .chip:hover { border-color:var(--accent); color:var(--accent); }
+  .hint { color:var(--muted); font-size:14px; margin-top:8px; }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Помощник КЦ</h1>
+  <p class="sub">Тестовая версия. Бот отвечает по базе знаний контакт-центра за несколько секунд.</p>
+
+  <div class="card">
+    <h2>Как пользоваться</h2>
+    <ul>
+      <li>Откройте чат справа внизу и напишите вопрос так, как спросили бы коллегу: <code>пациент с отеком и температурой что делать</code>.</li>
+      <li>Ответ приходит за 3–6 секунд, в конце указан документ-источник.</li>
+      <li>Если в базе ответа нет, бот так и скажет — уточните у старшего администратора.</li>
+      <li>Для нового вопроса по другой теме лучше начинать новый чат.</li>
+    </ul>
+  </div>
+
+  <div class="card warn">
+    <h2>Важно</h2>
+    <ul>
+      <li>Не вводите ФИО, телефоны и диагнозы пациентов.</li>
+      <li>Бот — подсказка, а не регламент. Если ответ кажется странным — сверьтесь с документом.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Примеры вопросов</h2>
+    <div class="chips" id="chips">
+      <button class="chip">пациент с отеком щеки и температурой что делать</button>
+      <button class="chip">бабушка привела ребенка 10 лет на первый прием</button>
+      <button class="chip">пациент хочет на гигиену, десны кровоточат</button>
+      <button class="chip">какая гарантия на коронку</button>
+      <button class="chip">не дозвонились накануне подтвердить визит</button>
+      <button class="chip">пациент по ДМС хочет в другую клинику</button>
+    </div>
+    <p class="hint" id="copied">Нажмите на пример — он скопируется, вставьте его в чат.</p>
+  </div>
+
+  <div class="card">
+    <h2>Что есть в базе</h2>
+    <ul>
+      <li>Регламент КЦ 2025, алгоритмы записи пациентов, скрипты стоматологии</li>
+      <li>Травма и острая боль, куда направлять в стационары</li>
+      <li>К гигиенисту или пародонтологу, конфликты и сложные ситуации</li>
+      <li>Гарантии, справки, оборудование, взрослые наркозы и седация</li>
+      <li>Работа с базой пациентов в ПРОМИС</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Нашли ошибку?</h2>
+    <p style="margin:0">Напишите в чат задачи «База знаний КЦ» в Битрикс24: ваш вопрос, ответ бота и как правильно. Это поможет поправить базу до запуска.</p>
+  </div>
+</main>
+
+<script>
+  document.getElementById('chips').addEventListener('click', function (e) {
+    var b = e.target.closest('.chip'); if (!b) return;
+    var t = b.textContent.trim();
+    var done = function () { document.getElementById('copied').textContent = 'Скопировано: «' + t + '» — вставьте в чат (Ctrl+V).'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t).then(done, done); } else { done(); }
+  });
+</script>
+<script async src="https://timeweb.cloud/api/v1/cloud-ai/agents/d94b4d73-2ce5-4006-a6f5-4039b60c2d9e/embed.js?collapsed=false"></script>
+</body>
+</html>
