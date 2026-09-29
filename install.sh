@@ -37,8 +37,27 @@ DOCS_DIR = os.path.join(DATA_DIR, "docs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 os.makedirs(DOCS_DIR, exist_ok=True)
 
-MODELS = ["deepseek-v4.1-flash", "gemini-3.5-flash-lite", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
+MODELS = ["gemini-3.5-flash-lite", "deepseek-v4.1-flash", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
 SESSIONS = {}
+SESS_FILE = os.path.join(DATA_DIR, "sessions.json")
+VERSION = "3"
+
+
+def save_sessions():
+    try:
+        with open(SESS_FILE, "w") as f:
+            json.dump(list(SESSIONS.keys()), f)
+    except OSError:
+        pass
+
+
+def load_sessions():
+    try:
+        with open(SESS_FILE) as f:
+            for s in json.load(f):
+                SESSIONS[s] = 0
+    except (OSError, ValueError):
+        pass
 INDEX = {"chunks": [], "built": None, "emb_tokens": 0}
 INDEX_LOCK = threading.Lock()
 
@@ -127,6 +146,7 @@ def build_index():
     with INDEX_LOCK:
         INDEX.clear()
         INDEX.update(idx)
+        bm25_prepare()
     return idx
 
 
@@ -134,17 +154,67 @@ def load_index():
     if os.path.exists(INDEX_FILE):
         with open(INDEX_FILE, encoding="utf-8") as f:
             INDEX.update(json.load(f))
+        bm25_prepare()
+
+
+STOP = set("и в во на с со к ко по о об от до за из у не ни а но или же ли то что как так для при это этот эта эти его ее её их мы вы он она они же бы был была были есть нет да ли уже ещё еще".split())
+QCACHE = {}
+
+
+def toks(text):
+    out = []
+    for w in re.findall(r"[a-zа-яё0-9]+", text.lower().replace("ё", "е")):
+        if w in STOP or (len(w) < 3 and not w.isdigit()):
+            continue
+        out.append(w[:6] if len(w) > 6 else w)
+    return out
+
+
+def bm25_prepare():
+    chunks = INDEX.get("chunks", [])
+    df = {}
+    for c in chunks:
+        c["tf"] = {}
+        for t in toks(c["doc"] + " " + c["text"]):
+            c["tf"][t] = c["tf"].get(t, 0) + 1
+        c["len"] = sum(c["tf"].values())
+        for t in c["tf"]:
+            df[t] = df.get(t, 0) + 1
+    n = max(len(chunks), 1)
+    INDEX["idf"] = {t: math.log(1 + (n - d + 0.5) / (d + 0.5)) for t, d in df.items()}
+    INDEX["avglen"] = sum(c["len"] for c in chunks) / n if chunks else 1
+
+
+def bm25(qt, c, k1=1.4, b=0.75):
+    idf, avg, s = INDEX["idf"], INDEX["avglen"], 0.0
+    for t in qt:
+        f = c["tf"].get(t)
+        if f:
+            s += idf.get(t, 0) * f * (k1 + 1) / (f + k1 * (1 - b + b * c["len"] / avg))
+    return s
 
 
 def search(q, k=12):
+    """Гибридный поиск: смысл (эмбеддинги) + совпадение слов (BM25), объединение рангов (RRF)."""
     t0 = time.time()
-    qv, qtok = embed([q])
-    qv = norm(qv[0])
+    if q in QCACHE:
+        qv, qtok = QCACHE[q], 0
+    else:
+        v, qtok = embed([q])
+        qv = QCACHE[q] = norm(v[0])
+        if len(QCACHE) > 500:
+            QCACHE.pop(next(iter(QCACHE)))
     t_emb = time.time() - t0
     t1 = time.time()
+    qt = toks(q)
     with INDEX_LOCK:
         chunks = INDEX["chunks"]
-        scored = sorted(((sum(a * b for a, b in zip(qv, c["v"])), c) for c in chunks), key=lambda x: -x[0])[:k]
+        cos = [sum(a * b for a, b in zip(qv, c["v"])) for c in chunks]
+        bm = [bm25(qt, c) for c in chunks]
+    r_cos = {i: r for r, i in enumerate(sorted(range(len(chunks)), key=lambda i: -cos[i]))}
+    r_bm = {i: r for r, i in enumerate(sorted(range(len(chunks)), key=lambda i: -bm[i]))}
+    fused = sorted(range(len(chunks)), key=lambda i: -(1.0 / (60 + r_cos[i]) + (1.0 / (60 + r_bm[i]) if bm[i] > 0 else 0)))
+    scored = [(cos[i], chunks[i]) for i in fused[:k]]
     t_search = time.time() - t1
     return scored, t_emb, t_search, qtok
 
@@ -164,20 +234,20 @@ def rerank(q, cands, top_n=4):
     return picked, time.time() - t0, ok
 
 
-def answer_ait(q, model, nothink, use_rerank=True):
+def answer_ait(q, model, nothink, use_rerank=False, top_k=6):
     if not INDEX.get("chunks"):
         raise RuntimeError("Индекс пуст: загрузите документы в /admin и нажмите «Переиндексировать»")
     T0 = time.time()
     cands, t_emb, t_search, qtok = search(q)
     if use_rerank:
-        top, t_rr, rr_ok = rerank(q, cands)
+        top, t_rr, rr_ok = rerank(q, cands, top_n=top_k)
     else:
-        top, t_rr, rr_ok = [(s, c) for s, c in cands[:4]], 0.0, False
+        top, t_rr, rr_ok = [(s, c) for s, c in cands[:top_k]], 0.0, False
     ctx = "\n\n".join("--- Фрагмент %d. Документ: «%s»\n%s" % (i + 1, c["doc"], c["text"]) for i, (_, c) in enumerate(top))
     body = {"model": model, "temperature": 0.2, "max_tokens": 700,
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": "Фрагменты базы знаний:\n" + ctx + "\n\nВопрос администратора: " + q}]}
-    if nothink:
+    if nothink and not model.startswith("gemini"):  # у Gemini рассуждение отключить нельзя (API вернёт 400)
         body["reasoning"] = {"effort": "none"}
     t1 = time.time()
     j = ait("/chat/completions", body)
@@ -238,7 +308,7 @@ MAIN = """
 <div class="bar"><div class="in"><div class="row"><textarea id="q" placeholder="Вопрос… (Enter — отправить)"></textarea><button id="send">Спросить</button></div>
 <div class="opts"><label>Движок <select id="engine"><option value="aitunnel">AITunnel + свой RAG</option><option value="timeweb">Timeweb агент</option></select></label>
 <label>Модель <select id="model">__MODELS__</select></label>
-<label><input type="checkbox" id="nothink" checked> без рассуждения</label><label><input type="checkbox" id="rerank" checked> реранк</label><span id="status"></span></div></div></div>
+<label><input type="checkbox" id="nothink" checked> без рассуждения</label><label><input type="checkbox" id="rerank"> реранк (+0,45 ₽)</label><span id="status"></span></div></div></div>
 <script>
 (function(){
 var log=document.getElementById('log'),q=document.getElementById('q'),send=document.getElementById('send'),st=document.getElementById('status'),stats=document.getElementById('stats'),T={};
@@ -248,7 +318,7 @@ function med(a){var b=a.slice().sort(function(x,y){return x-y}),m=Math.floor(b.l
 function upd(){var p=[];for(var k in T){p.push(k+': '+T[k].length+' вопр., медиана '+med(T[k]).toFixed(1)+' с')}stats.style.display=p.length?'':'none';stats.textContent='Итого — '+p.join(' · ')}
 window.kcAsk=function(text,opts){opts=opts||{};text=String(text).trim();if(!text)return Promise.resolve();
 var engine=opts.engine||document.getElementById('engine').value,model=opts.model||document.getElementById('model').value,nothink=opts.nothink!=null?opts.nothink:document.getElementById('nothink').checked,rr=opts.rerank!=null?opts.rerank:document.getElementById('rerank').checked;
-var label=engine==='timeweb'?'Timeweb агент':'AITunnel · '+model+(nothink?'':' · с рассуждением')+(rr?'':' · без реранка');
+var label=engine==='timeweb'?'Timeweb агент':'AITunnel · '+model+(nothink?'':' · с рассуждением')+(rr?' · реранк':'');
 var qd=document.createElement('div');qd.className='card q';qd.textContent=text;log.appendChild(qd);var ad=document.createElement('div');ad.className='card';ad.innerHTML='<span class="meta">Жду ответ…</span>';log.appendChild(ad);ad.scrollIntoView({block:'end'});
 send.disabled=true;q.value='';var t0=performance.now(),tm=setInterval(function(){st.textContent=((performance.now()-t0)/1000).toFixed(1)+' с…'},100);
 return fetch('api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:text,engine:engine,model:model,nothink:nothink,rerank:rr})}).then(function(r){return r.json()}).then(function(j){
@@ -321,6 +391,7 @@ class H(BaseHTTPRequestHandler):
         p = self.route()
         if p.endswith("/logout"):
             SESSIONS.pop(self.sid(), None)
+            save_sessions()
             return self.send(302, b"", headers={"Location": "./", "Set-Cookie": "kc_sid=; Max-Age=0; Path=/"})
         if not self.sid():
             return self.send(200, login_page())
@@ -330,7 +401,7 @@ class H(BaseHTTPRequestHandler):
                 counts[c["file"]] = counts.get(c["file"], 0) + 1
             docs = [{"name": fn, "kb": round(os.path.getsize(os.path.join(DOCS_DIR, fn)) / 1024, 1), "chunks": counts.get(fn, 0)}
                     for fn in sorted(os.listdir(DOCS_DIR))]
-            return self.js(200, {"built": INDEX.get("built"), "chunks": len(INDEX.get("chunks", [])),
+            return self.js(200, {"version": VERSION, "built": INDEX.get("built"), "chunks": len(INDEX.get("chunks", [])),
                                  "emb_tokens": INDEX.get("emb_tokens"), "docs": docs})
         if p.endswith("/admin"):
             return self.send(200, page(ADMIN))
@@ -346,6 +417,7 @@ class H(BaseHTTPRequestHandler):
             if hmac.compare_digest(pw.encode(), PASSWORD.encode()):
                 s = secrets.token_urlsafe(24)
                 SESSIONS[s] = 0
+                save_sessions()
                 return self.send(302, b"", headers={"Location": "./", "Set-Cookie": "kc_sid=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800" % s})
             time.sleep(1)
             return self.send(200, login_page("Неверный пароль"))
@@ -377,7 +449,7 @@ class H(BaseHTTPRequestHandler):
                 if data.get("engine") == "timeweb":
                     return self.js(200, answer_tw(q, bool(data.get("nothink"))))
                 model = data.get("model") if data.get("model") in MODELS else MODELS[0]
-                return self.js(200, answer_ait(q, model, bool(data.get("nothink")), data.get("rerank", True) is not False))
+                return self.js(200, answer_ait(q, model, bool(data.get("nothink")), data.get("rerank") is True, int(data.get("top_k") or 6)))
         except Exception as e:
             return self.js(502, {"error": str(e)[:400]})
         self.send(404, b"not found")
@@ -387,6 +459,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    load_sessions()
     load_index()
     print("kc-test on port", PORT, "chunks:", len(INDEX.get("chunks", [])))
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
