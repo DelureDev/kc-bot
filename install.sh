@@ -17,7 +17,8 @@ cat > /opt/kc-test/app.py <<'PYEOF'
 Только стандартная библиотека Python 3.8+.
 
 Переменные окружения: PAGE_PASSWORD, PORT, TW_TOKEN, TW_AGENT_ID, AITUNNEL_KEY,
-AIT_BASE, EMB_MODEL, RERANK_MODEL, DATA_DIR, CLOUDRU_KEY, CLOUDRU_BASE, TWGW_KEY, TWGW_BASE, GIGACHAT_*.
+AIT_BASE, EMB_MODEL, RERANK_MODEL, DATA_DIR, CLOUDRU_KEY, CLOUDRU_BASE, TWGW_KEY, TWGW_BASE, GIGACHAT_*,
+EMBED_KEY (ключ виджета /embed), EMBED_MODEL, EMBED_FALLBACK, EMBED_DAY_LIMIT.
 """
 import hmac, http.cookies, json, math, os, re, secrets, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
@@ -55,7 +56,14 @@ CAT = {p: {"models": [], "raw": {}, "ts": 0, "err": ""} for p in PROV}
 MODELS = ["gemini-3.5-flash-lite", "gpt-6-luna", "deepseek-v4.1-flash", "gpt-5.4-mini", "qwen3.8-flash", "claude-haiku-4.5"]
 SESSIONS = {}
 SESS_FILE = os.path.join(DATA_DIR, "sessions.json")
-VERSION = "6"
+VERSION = "7"
+# Встраиваемый виджет (/embed) для 1С и других сайтов: вход по ключу вместо пароля, одна модель, CORS.
+EMBED_KEY = os.environ.get("EMBED_KEY", "")
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "aitunnel")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "gpt-6-luna")
+EMBED_FALLBACK = os.environ.get("EMBED_FALLBACK", "gemini-3.1-flash-lite")
+EMBED_DAY_LIMIT = int(os.environ.get("EMBED_DAY_LIMIT", "3000"))
+EMBED_COUNT = {"day": "", "n": 0}
 
 
 def save_sessions():
@@ -556,6 +564,79 @@ def login_page(err=""):
                 "<input type='password' name='password' autofocus placeholder='Пароль'>" + e + "<button type='submit'>Войти</button></form>")
 
 
+
+EMBED = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><title>Помощник КЦ</title><style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#1c2230;--muted:#5d6678;--accent:#0f6f73;--border:#dfe4ea;--q:#e8f2f1;--bad:#b3261e}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI",Roboto,Arial,sans-serif;display:flex;flex-direction:column}
+#log{flex:1;overflow-y:auto;padding:12px 14px}
+.hint{color:var(--muted);font-size:13px;margin:4px 0 10px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:4px 10px;font:inherit;font-size:13px;cursor:pointer}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin:0 0 8px}
+.q{background:var(--q);border-color:transparent;font-weight:600}
+.ans p{margin:0 0 5px}.ans ul{margin:0 0 5px;padding-left:18px}.ans li{margin:0 0 3px}
+.meta{color:var(--muted);font-size:12px;margin-top:6px}.err{color:var(--bad)}
+.bar{border-top:1px solid var(--border);background:var(--card);padding:10px 14px;display:flex;gap:8px}
+textarea{flex:1;resize:none;height:44px;padding:9px 11px;border-radius:9px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit}
+button.send{border:0;border-radius:9px;padding:0 16px;background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button.send:disabled{opacity:.5}
+</style></head><body>
+<div id="log"><div class="hint">Задайте вопрос по регламенту КЦ. Ответ строится только по базе знаний. Не вводите ФИО, телефоны и диагнозы пациентов.</div>
+<div class="chips" id="chips"><button class="chip">пациент с отеком щеки и температурой что делать</button><button class="chip">бабушка привела ребенка 10 лет</button><button class="chip">какая гарантия на коронку</button></div></div>
+<div class="bar"><textarea id="q" placeholder="Вопрос… (Enter — отправить)"></textarea><button class="send" id="send">Спросить</button></div>
+<script>
+(function(){
+var API="__API__", KEY="__KEY__";
+var log=document.getElementById('log'),q=document.getElementById('q'),send=document.getElementById('send');
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function md(s){var L=esc(s).split('\\n'),h='',ul=false;L.forEach(function(l){var m=l.match(/^\\s*(?:[-*•]|\\d+[.)])\\s+(.*)/);l=(m?m[1]:l).replace(/\\*\\*(.+?)\\*\\*/g,'<b>$1</b>');if(m){if(!ul){h+='<ul>';ul=true}h+='<li>'+l+'</li>'}else{if(ul){h+='</ul>';ul=false}if(l.trim())h+='<p>'+l+'</p>'}});return h+(ul?'</ul>':'')}
+function ask(text){text=String(text||'').trim();if(!text||send.disabled)return;
+var qd=document.createElement('div');qd.className='card q';qd.textContent=text;log.appendChild(qd);
+var ad=document.createElement('div');ad.className='card';ad.innerHTML='<span class="meta">Ищу в базе…</span>';log.appendChild(ad);log.scrollTop=log.scrollHeight;
+send.disabled=true;q.value='';var t0=Date.now();
+var x=new XMLHttpRequest();x.open('POST',API,true);x.setRequestHeader('Content-Type','text/plain;charset=UTF-8');x.timeout=60000;
+x.onload=function(){var j={};try{j=JSON.parse(x.responseText)}catch(e){j={error:'Сервер ответил не JSON ('+x.status+')'}}
+ if(j.error){ad.innerHTML='<div class="err">'+esc(j.error)+'</div>'}else{ad.innerHTML='<div class="ans">'+md(j.answer||'(пусто)')+'</div><div class="meta">'+((Date.now()-t0)/1000).toFixed(1)+' с</div>'}done()};
+x.onerror=function(){ad.innerHTML='<div class="err">Нет связи с сервером помощника ('+esc(API)+')</div>';done()};
+x.ontimeout=function(){ad.innerHTML='<div class="err">Сервер не ответил за 60 с</div>';done()};
+x.send(JSON.stringify({q:text,k:KEY}))}
+function done(){send.disabled=false;log.scrollTop=log.scrollHeight;q.focus()}
+send.onclick=function(){ask(q.value)};
+q.onkeydown=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask(q.value)}};
+document.getElementById('chips').onclick=function(e){var b=e.target.closest?e.target.closest('.chip'):null;if(b)ask(b.textContent)};
+})();
+</script></body></html>"""
+
+
+def embed_ok(k):
+    return bool(EMBED_KEY) and hmac.compare_digest(str(k or "").encode(), EMBED_KEY.encode())
+
+
+def embed_answer(q):
+    day = time.strftime("%Y-%m-%d")
+    if EMBED_COUNT["day"] != day:
+        EMBED_COUNT.update(day=day, n=0)
+    EMBED_COUNT["n"] += 1
+    if EMBED_COUNT["n"] > EMBED_DAY_LIMIT:
+        raise RuntimeError("Дневной лимит вопросов исчерпан")
+    try:
+        return answer_ait(q, EMBED_MODEL, True, provider=EMBED_PROVIDER)
+    except Exception:
+        if not EMBED_FALLBACK:
+            raise
+        return answer_ait(q, EMBED_FALLBACK, True, provider=EMBED_PROVIDER)
+
+
+def public_base(h):
+    """Внешний адрес сервера по заголовкам запроса (для абсолютной ссылки на API в виджете)."""
+    host = h.headers.get("X-Forwarded-Host") or h.headers.get("Host") or ("localhost:%d" % PORT)
+    proto = h.headers.get("X-Forwarded-Proto") or "http"
+    return "%s://%s" % (proto, re.sub(r"[^\w.:\-\[\]]", "", host))
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "kc-test"
 
@@ -574,8 +655,16 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def js(self, code, obj):
-        self.send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+    def js(self, code, obj, headers=None):
+        self.send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", headers)
+
+    CORS = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Max-Age": "86400"}
+
+    def do_OPTIONS(self):
+        if self.route().endswith("/embed/api"):
+            return self.send(204, b"", headers=self.CORS)
+        self.send(404, b"not found")
 
     def route(self):
         p = urllib.parse.urlparse(self.path).path
@@ -587,6 +676,12 @@ class H(BaseHTTPRequestHandler):
             SESSIONS.pop(self.sid(), None)
             save_sessions()
             return self.send(302, b"", headers={"Location": "./", "Set-Cookie": "kc_sid=; Max-Age=0; Path=/"})
+        if p.endswith("/embed"):
+            k = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("k", [""])[0]
+            if not embed_ok(k):
+                return self.send(403, "<p style='font:14px sans-serif'>Нет доступа: неверный ключ виджета (параметр k).</p>".encode("utf-8"))
+            api = public_base(self) + "/embed/api"
+            return self.send(200, EMBED.replace("__API__", api).replace("__KEY__", k).encode("utf-8"))
         if not self.sid():
             return self.send(200, login_page())
         if p.endswith("/admin/state"):
@@ -630,6 +725,21 @@ class H(BaseHTTPRequestHandler):
                 return self.send(302, b"", headers={"Location": "./", "Set-Cookie": "kc_sid=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800" % s})
             time.sleep(1)
             return self.send(200, login_page("Неверный пароль"))
+        if p.endswith("/embed/api"):
+            try:
+                data = json.loads(raw or b"{}")
+            except ValueError:
+                data = {}
+            if not embed_ok(data.get("k")):
+                return self.js(403, {"error": "Неверный ключ виджета"}, self.CORS)
+            q = str(data.get("q", "")).strip()
+            if not q or len(q) > 1000:
+                return self.js(400, {"error": "Пустой или слишком длинный вопрос"}, self.CORS)
+            try:
+                r = embed_answer(q)
+                return self.js(200, {"answer": r["answer"], "model": r.get("model"), "timing": r.get("timing")}, self.CORS)
+            except Exception as e:
+                return self.js(502, {"error": "Помощник недоступен: " + str(e)[:200]}, self.CORS)
         s = self.sid()
         if not s:
             return self.js(401, {"error": "Нужно войти заново"})
@@ -722,6 +832,10 @@ if ! grep -q "BEGIN CERTIFICATE" /opt/kc-test/russian_trusted_root_ca.pem 2>/dev
   if grep -q "BEGIN CERTIFICATE" "$TMPCA"; then install -m 644 "$TMPCA" /opt/kc-test/russian_trusted_root_ca.pem; else echo "Внимание: не удалось скачать сертификат Минцифры (нужен только для GigaChat)"; fi
   rm -f "$TMPCA"
 fi
+# Ключ виджета /embed (для 1С и iframe) — генерируется один раз
+if [ -z "$(getv EMBED_KEY)" ]; then
+  echo "EMBED_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')" >> "$ENVF"
+fi
 [ -n "$(getv TW_AGENT_ID)" ] || echo "TW_AGENT_ID=d94b4d73-2ce5-4006-a6f5-4039b60c2d9e" >> "$ENVF"
 [ -n "$(getv PORT)" ] || echo "PORT=8790" >> "$ENVF"
 PORT=$(getv PORT)
@@ -748,7 +862,10 @@ systemctl restart kc-test
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow ${PORT}/tcp >/dev/null; fi
 sleep 1.5
 if systemctl is-active --quiet kc-test; then
-  echo "Готово: http://$(hostname -I | awk '{print $1}'):${PORT}/"
+  IP=$(hostname -I | awk '{print $1}')
+  echo "Готово: http://${IP}:${PORT}/"
+  echo "Виджет для 1С / iframe: http://${IP}:${PORT}/embed?k=$(getv EMBED_KEY)"
+  echo "  (если сервер виден снаружи под другим IP — подставьте его вместо ${IP})"
   grep -q '^AITUNNEL_KEY=' "$ENVF" && echo "Ключ AITunnel: задан" || echo "Ключ AITunnel: НЕ задан"
   grep -q '^CLOUDRU_KEY=' "$ENVF" && echo "Ключ Cloud.ru: задан" || echo "Ключ Cloud.ru: не задан"
   grep -q '^TWGW_KEY=' "$ENVF" && echo "Ключ Timeweb AI Gateway: задан" || echo "Ключ Timeweb AI Gateway: не задан"
