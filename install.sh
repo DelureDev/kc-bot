@@ -20,7 +20,7 @@ cat > /opt/kc-test/app.py <<'PYEOF'
 AIT_BASE, EMB_MODEL, RERANK_MODEL, DATA_DIR, CLOUDRU_KEY, CLOUDRU_BASE, TWGW_KEY, TWGW_BASE, GIGACHAT_*,
 EMBED_KEY (ключ виджета /embed), EMBED_MODEL, EMBED_FALLBACK, EMBED_DAY_LIMIT.
 """
-import hmac, http.cookies, json, math, os, re, secrets, threading, time, uuid
+import hmac, html, http.cookies, json, math, os, re, secrets, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -64,6 +64,12 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "gpt-6-luna")
 EMBED_FALLBACK = os.environ.get("EMBED_FALLBACK", "gemini-3.1-flash-lite")
 EMBED_DAY_LIMIT = int(os.environ.get("EMBED_DAY_LIMIT", "3000"))
 EMBED_COUNT = {"day": "", "n": 0}
+# Временный выбор модели в виджете: EMBED_CHOICE=0 в env — убрать выбор (останется EMBED_MODEL).
+EMBED_CHOICE = os.environ.get("EMBED_CHOICE", "1") != "0"
+EMBED_MODELS = [tuple(x.split("|", 1)) for x in os.environ.get(
+    "EMBED_MODELS",
+    "aitunnel:gpt-6-luna|GPT-6 Luna,aitunnel:gemini-3.1-flash-lite|Gemini 3.1 Flash-Lite,twgw:yandex/yandexgpt-pro-5.1|YandexGPT Pro 5.1"
+).split(",") if "|" in x and ":" in x.split("|", 1)[0]]
 
 
 def save_sessions():
@@ -579,18 +585,21 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI",Ro
 .q{background:var(--q);border-color:transparent;font-weight:600}
 .ans p{margin:0 0 5px}.ans ul{margin:0 0 5px;padding-left:18px}.ans li{margin:0 0 3px}
 .meta{color:var(--muted);font-size:12px;margin-top:6px}.err{color:var(--bad)}
-.bar{border-top:1px solid var(--border);background:var(--card);padding:10px 14px;display:flex;gap:8px}
+.bar{border-top:1px solid var(--border);background:var(--card);padding:10px 14px;display:flex;gap:8px;flex-wrap:wrap}
+.bar .row{display:flex;gap:8px;width:100%}
+select{padding:4px 8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit;font-size:13px}
+.pick{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
 textarea{flex:1;resize:none;height:44px;padding:9px 11px;border-radius:9px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit}
 button.send{border:0;border-radius:9px;padding:0 16px;background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
 button.send:disabled{opacity:.5}
 </style></head><body>
 <div id="log"><div class="hint">Задайте вопрос по регламенту КЦ. Ответ строится только по базе знаний. Не вводите ФИО, телефоны и диагнозы пациентов.</div>
 <div class="chips" id="chips"><button class="chip">пациент с отеком щеки и температурой что делать</button><button class="chip">бабушка привела ребенка 10 лет</button><button class="chip">какая гарантия на коронку</button></div></div>
-<div class="bar"><textarea id="q" placeholder="Вопрос… (Enter — отправить)"></textarea><button class="send" id="send">Спросить</button></div>
+<div class="bar"><div class="row"><textarea id="q" placeholder="Вопрос… (Enter — отправить)"></textarea><button class="send" id="send">Спросить</button></div>__PICK__</div>
 <script>
 (function(){
 var API="__API__", KEY="__KEY__";
-var log=document.getElementById('log'),q=document.getElementById('q'),send=document.getElementById('send');
+var log=document.getElementById('log'),q=document.getElementById('q'),send=document.getElementById('send'),pick=document.getElementById('m');
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function md(s){var L=esc(s).split('\\n'),h='',ul=false;L.forEach(function(l){var m=l.match(/^\\s*(?:[-*•]|\\d+[.)])\\s+(.*)/);l=(m?m[1]:l).replace(/\\*\\*(.+?)\\*\\*/g,'<b>$1</b>');if(m){if(!ul){h+='<ul>';ul=true}h+='<li>'+l+'</li>'}else{if(ul){h+='</ul>';ul=false}if(l.trim())h+='<p>'+l+'</p>'}});return h+(ul?'</ul>':'')}
 function ask(text){text=String(text||'').trim();if(!text||send.disabled)return;
@@ -599,10 +608,10 @@ var ad=document.createElement('div');ad.className='card';ad.innerHTML='<span cla
 send.disabled=true;q.value='';var t0=Date.now();
 var x=new XMLHttpRequest();x.open('POST',API,true);x.setRequestHeader('Content-Type','text/plain;charset=UTF-8');x.timeout=60000;
 x.onload=function(){var j={};try{j=JSON.parse(x.responseText)}catch(e){j={error:'Сервер ответил не JSON ('+x.status+')'}}
- if(j.error){ad.innerHTML='<div class="err">'+esc(j.error)+'</div>'}else{ad.innerHTML='<div class="ans">'+md(j.answer||'(пусто)')+'</div><div class="meta">'+((Date.now()-t0)/1000).toFixed(1)+' с</div>'}done()};
+ if(j.error){ad.innerHTML='<div class="err">'+esc(j.error)+'</div>'}else{ad.innerHTML='<div class="ans">'+md(j.answer||'(пусто)')+'</div><div class="meta">'+((Date.now()-t0)/1000).toFixed(1)+' с · '+esc(j.label||j.model||'')+(j.fallback?' (запасная)':'')+'</div>'}done()};
 x.onerror=function(){ad.innerHTML='<div class="err">Нет связи с сервером помощника ('+esc(API)+')</div>';done()};
 x.ontimeout=function(){ad.innerHTML='<div class="err">Сервер не ответил за 60 с</div>';done()};
-x.send(JSON.stringify({q:text,k:KEY}))}
+x.send(JSON.stringify({q:text,k:KEY,m:pick?pick.value:''}))}
 function done(){send.disabled=false;log.scrollTop=log.scrollHeight;q.focus()}
 send.onclick=function(){ask(q.value)};
 q.onkeydown=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask(q.value)}};
@@ -615,19 +624,34 @@ def embed_ok(k):
     return bool(EMBED_KEY) and hmac.compare_digest(str(k or "").encode(), EMBED_KEY.encode())
 
 
-def embed_answer(q):
+def embed_label(prov, model):
+    for pm, label in EMBED_MODELS:
+        if pm == "%s:%s" % (prov, model):
+            return label
+    return model
+
+
+def embed_answer(q, choice=""):
     day = time.strftime("%Y-%m-%d")
     if EMBED_COUNT["day"] != day:
         EMBED_COUNT.update(day=day, n=0)
     EMBED_COUNT["n"] += 1
     if EMBED_COUNT["n"] > EMBED_DAY_LIMIT:
         raise RuntimeError("Дневной лимит вопросов исчерпан")
+    if EMBED_CHOICE and choice and choice in [pm for pm, _ in EMBED_MODELS]:
+        prov, model = choice.split(":", 1)
+        r = answer_ait(q, model, True, provider=prov)  # выбранная вручную модель — без подмены на запасную
+        r["label"] = embed_label(prov, model)
+        return r
     try:
-        return answer_ait(q, EMBED_MODEL, True, provider=EMBED_PROVIDER)
+        r = answer_ait(q, EMBED_MODEL, True, provider=EMBED_PROVIDER)
+        r["label"] = embed_label(EMBED_PROVIDER, EMBED_MODEL)
     except Exception:
         if not EMBED_FALLBACK:
             raise
-        return answer_ait(q, EMBED_FALLBACK, True, provider=EMBED_PROVIDER)
+        r = answer_ait(q, EMBED_FALLBACK, True, provider=EMBED_PROVIDER)
+        r["label"], r["fallback"] = embed_label(EMBED_PROVIDER, EMBED_FALLBACK), True
+    return r
 
 
 def public_base(h):
@@ -681,7 +705,14 @@ class H(BaseHTTPRequestHandler):
             if not embed_ok(k):
                 return self.send(403, "<p style='font:14px sans-serif'>Нет доступа: неверный ключ виджета (параметр k).</p>".encode("utf-8"))
             api = public_base(self) + "/embed/api"
-            return self.send(200, EMBED.replace("__API__", api).replace("__KEY__", k).encode("utf-8"))
+            pick = ""
+            if EMBED_CHOICE and EMBED_MODELS:
+                opts = [("", "Основная: %s" % embed_label(EMBED_PROVIDER, EMBED_MODEL))] + \
+                       [(pm, lab) for pm, lab in EMBED_MODELS if PROV.get(pm.split(":", 1)[0], {}).get("key")
+                        and pm != "%s:%s" % (EMBED_PROVIDER, EMBED_MODEL)]
+                pick = "<label class='pick'>Модель (временно для теста) <select id='m'>%s</select></label>" % "".join(
+                    "<option value='%s'>%s</option>" % (html.escape(v, True), html.escape(t)) for v, t in opts)
+            return self.send(200, EMBED.replace("__API__", api).replace("__KEY__", k).replace("__PICK__", pick).encode("utf-8"))
         if not self.sid():
             return self.send(200, login_page())
         if p.endswith("/admin/state"):
@@ -736,8 +767,9 @@ class H(BaseHTTPRequestHandler):
             if not q or len(q) > 1000:
                 return self.js(400, {"error": "Пустой или слишком длинный вопрос"}, self.CORS)
             try:
-                r = embed_answer(q)
-                return self.js(200, {"answer": r["answer"], "model": r.get("model"), "timing": r.get("timing")}, self.CORS)
+                r = embed_answer(q, str(data.get("m") or ""))
+                return self.js(200, {"answer": r["answer"], "model": r.get("model"), "label": r.get("label"),
+                                     "fallback": bool(r.get("fallback")), "timing": r.get("timing")}, self.CORS)
             except Exception as e:
                 return self.js(502, {"error": "Помощник недоступен: " + str(e)[:200]}, self.CORS)
         s = self.sid()
